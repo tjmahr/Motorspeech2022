@@ -1,0 +1,859 @@
+---
+title: "Lexical predictors of single-word intelligibility in young children’s speech"
+author: 
+  - Tristan Mahr
+  - Katherine Hustad
+output: 
+  rmarkdown::html_document: 
+    keep_md: true
+bibliography: ./refs.bib
+csl: ./apa.csl
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  comment = "#>", 
+  collapse = TRUE,
+  echo = FALSE, 
+  message = FALSE, 
+  warning = FALSE
+)
+```
+
+```{r packages-and-functions}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+```
+
+```{r load-data}
+data <- targets::tar_read("data_model") %>% 
+  filter(prompt == sentence)
+m_freq_prob_comp <- targets::tar_read("model_freq_prob_comp_age_slope")
+```
+
+```{r make-table-1}
+t1 <- data %>% 
+  group_by(prompt) %>% 
+  # Computing statistics
+  summarise(
+    n = n(),
+    successes = sum(m_word_a),
+    intelligibility = mean(m_word_a),
+    freq_per_million = unique(10 ^ zipf_freq3), 
+    avg_biphone_prob = unique(avg_biphone_prob), 
+    complexity = unique(complexity)
+  ) %>% 
+  mutate(
+    avg_biphone_prob_rank = -avg_biphone_prob %>% row_number(),
+    freq_per_million_rank = -freq_per_million %>% row_number(), 
+    # Use binomial confidence interval
+    ci = purrr::map2(successes, n, Hmisc::binconf, return.df = TRUE),
+  ) %>% 
+  unnest(ci) %>% 
+  # Formatting
+  mutate(
+    Lower = Lower %>% scales::percent(1, suffix = ""),
+    Upper = Upper %>% scales::percent(1, suffix = ""),
+    intelligibility = intelligibility %>% scales::percent(1.1, suffix = "%"),
+    ci = glue::glue("[{Lower}, {Upper}]"),
+    freq_per_million_rank = freq_per_million_rank %>% 
+      stringr::str_pad(width = 2, side = "left", " "),
+    avg_biphone_prob_rank = avg_biphone_prob_rank %>% 
+      stringr::str_pad(width = 2, side = "left", " "),
+    freq_per_million = freq_per_million %>% printy::fmt_fix_digits(1),
+    avg_biphone_prob = avg_biphone_prob %>% 
+      printy::fmt_fix_digits(5) %>% 
+      printy::fmt_leading_zero(),
+  ) %>% 
+  select(
+    prompt, intelligibility, ci, freq_per_million, freq_per_million_rank, 
+    avg_biphone_prob, avg_biphone_prob_rank, complexity
+  ) %>% 
+  mutate(
+    intel = glue::glue("{intelligibility} {ci}"),
+    freq_per_million = glue::glue(
+      "{freq_per_million} [{freq_per_million_rank}]"
+    ),
+    avg_biphone_prob = glue::glue(
+      "{avg_biphone_prob} [{avg_biphone_prob_rank}]"
+    ),
+  ) %>% 
+  arrange(desc(intelligibility)) %>% 
+  select(
+    Item = prompt,
+    `Intelligibility [95% CI]` = intel,
+    `Freq. per million [Rank]` = freq_per_million,
+    `Mean biphone probability [Rank]` = avg_biphone_prob,
+    `Motor complexity` = complexity
+  ) 
+```
+
+
+```{r inline-demographics}
+data_demos <- data %>% 
+  distinct(child, age, sex)
+
+n_overall <- nrow(data_demos)
+
+age_min <- min(data_demos$age)
+age_max <- max(data_demos$age)
+
+n_age_30_35 <- sum(between(data_demos$age, 30, 35))
+n_age_36_41 <- sum(between(data_demos$age, 36, 41))
+n_age_42_47 <- sum(between(data_demos$age, 42, 47))
+
+n_female <- sum(data_demos$sex == "F")
+n_male <- sum(data_demos$sex == "M")
+```
+
+```{r inline-model-results}
+# Plan: Get predictions for completely average data, average data but with a
+# unit increase in frequency, and the distribution of differences in the two
+# sets of predictions
+
+# Completely average data
+d1 <- data %>% 
+  distinct(prompt, zipf_freq3, log10_biphone3, complexity10) %>%
+  mutate(
+    age_years_3 = 0,
+    zipf_freq3 = mean(zipf_freq3),
+    log10_biphone3 = mean(log10_biphone3),
+    complexity10 = mean(complexity10),
+    prompt = "fake_prompt",
+    child = "fake_child"
+  ) %>% 
+  distinct() 
+
+fixef_draws <- d1 %>% 
+  mutate(case = "base") %>% 
+  # Completely average data but with 10x increase in frequency
+  bind_rows(
+    d1 %>% mutate(zipf_freq3 = zipf_freq3 + 1, case = "freq_up"),
+    d1 %>% mutate(age_years_3  = age_years_3 + .5, case = "age_up"),
+  ) %>% 
+  add_epred_draws(
+    m_freq_prob_comp, 
+    ndraws = 10000, 
+    re_formula = NA
+  ) 
+
+effects <- fixef_draws %>% 
+  ungroup() %>% 
+  # Compute differences in posterior predictions
+  distinct(.draw, case, .epred) %>% 
+  tidyr::pivot_wider(
+    id_cols = .draw, 
+    values_from = .epred, 
+    names_from = case
+  ) %>% 
+  mutate(
+    diff_freq = freq_up - base,
+    diff_age = age_up - base
+  ) %>% 
+  tidyr::pivot_longer(
+    cols = -.draw, 
+    names_to = "case", 
+    values_to = ".epred"
+  ) %>% 
+  # Compute summary stats on posteriors and store results in a list
+  group_by(case) %>% 
+  ggdist::median_qi() %>% 
+  mutate(
+    .lower = .lower %>% 
+      scales::percent(suffix = "", accuracy = 1) %>% 
+      printy::fmt_minus_sign(),
+    .upper = scales::percent(.upper,  accuracy = 1, suffix = ""),
+    .i = glue::glue("[{.lower}, {.upper}]")
+  ) %>% 
+  split(.$case)
+
+# Prepare inline stats
+unlog10 <- function(xs) 10 ^ xs
+
+mean_freq <- min(fixef_draws$zipf_freq3) %>% 
+  unlog10() %>% 
+  round(0)
+
+mean_phonprob <- min(fixef_draws$log10_biphone3 - 3) %>% 
+  unlog10() %>% 
+  round(4) %>% 
+  printy::fmt_leading_zero()
+
+mean_comp <- (fixef_draws$complexity10 + 10) %>% 
+  min() %>% 
+  round(2)
+
+base <- effects$base$.epred %>% scales::percent()
+
+diff_freq <- effects$diff_freq$.epred %>% 
+  scales::percent(accuracy = 1, suffix = "")
+
+diff_age <- effects$diff_age$.epred %>% 
+  scales::percent(accuracy = 1, suffix = "")
+
+base_ui <- effects$base$.i
+diff_ui <- effects$diff_freq$.i
+diff_age_ui <- effects$diff_age$.i
+
+or_phonprob_ui <- m_freq_prob_comp %>% 
+  fixef() %>% 
+  `[`(c("log10_biphone3"), c("Q2.5", "Q97.5")) %>% 
+  exp() %>% 
+  round(2)
+
+or_comp10_ui <- m_freq_prob_comp %>% 
+  fixef() %>% 
+  `[`(c("complexity10"), c("Q2.5", "Q97.5")) %>% 
+  exp() %>% 
+  round(2)
+
+or_comp10_med <- m_freq_prob_comp %>%
+  as.data.frame() %>% 
+  pull(b_complexity10) %>% 
+  exp() %>% 
+  median() %>% 
+  round(2)
+```
+
+```{r captions}
+f1_cap <- glue::glue(
+  "
+  *Figure 1.* Each item's estimated intelligibility score for a new, unobserved 
+  participant. These posterior predictions incorporate uncertainty about the 
+  overall average intelligibility, word-level effects, variation in the 
+  population of children, and variation for specific items. Thus, there's a 
+  50% probability that a typically developing 30--47-month-old's production of 
+  _eat_ will be at least 90% intelligible and a 95% probability that 
+  _full_ will be less than 50% intelligible.
+  "
+)
+
+f2_cap <- glue::glue(
+  "
+  *Figure 2.* Visualization of the frequency effect. There is a small, 
+  logarithmic effect of word frequency such that average frequency increases 
+  with 10x increases in frequency. Points and errors bars are the observed 
+  mean and standard error for each item.
+  "
+)
+
+t1_cap <- glue::glue(
+  "
+  *Table 1.* Item-level intelligibility results and measures. 
+  "
+)
+```
+
+## Submission details
+
+### Abstract
+
+Speech perception is a probabilistic process, integrating bottom-up and
+top-down sources of information, and the frequency or structure of a
+word can predict how well it is perceived. Therefore, instead of asking
+how intelligible speakers are, it is also important to ask how
+intelligible individual words are. For this study, we measured the
+intelligibility of 165 children between 30 and 47 months in age on 38
+different words and asked how words varied in intelligibility and
+whether word-level characteristics (frequency, phonotactic probability,
+motor complexity) predicted intelligibility. An item-response analysis
+showed that there was considerable variation in individual words with a
+reliable effect of frequency such that higher frequency words were more
+intelligible. 
+
+### Disclosure
+
+Tristan Mahr worked on this project while employed by the UW-Madison
+Waisman Center. He has no relevant nonfinancial relationships to
+disclose.
+
+Katherine Hustad received a research grant from the NIH to collect these
+data. She has no relevant nonfinancial relationships to disclose.            
+
+### Objective
+
+The learner will be able to list the word-level features that predict
+intelligibility.            
+
+
+
+
+## Rationale
+
+Intelligibility measures how well a listener is able to recover a
+speaker's intended message from a speech signal. Research commonly
+examines predictors of intelligibility by looking at speaker
+characteristics or acoustic features. But speech perception is
+probabilistic, and the frequency or structure of a word can predict how
+it is perceived [@vitevitch2016]. In other words, instead of asking
+how intelligible speakers are, it is also important to ask how
+intelligible individual words are. For this study, we measured the
+intelligibility of young children and asked how words varied in
+intelligibility and whether word-level characteristics (frequency,
+phonotactic probability, motor complexity) predicted intelligibility.
+
+
+## Methods
+
+**Participants**. Participants included `r n_overall` children
+(`r n_male` boys, `r n_female` girls) between `r age_min` and
+`r age_max` months in age. Children were evenly distributed across the
+overall age range: `r n_age_30_35` between 30--35 months,
+`r n_age_36_41` between 36--41 months, `r n_age_42_47` between 42--47
+months. Children had no history of speech or language concerns and
+scored within normal limits on a speech articulation assessment.
+
+**Task**. Speech samples were collected in a structured repetition task
+based on the TOCS+ [@hodgeTOCS]. Prompts included 40 single words; 2
+words were reserved for practice trials, so we analyzed the 38 test
+items. Unfamiliar listeners transcribed the children’s productions; they
+were played samples and instructed to type the words the child said.
+Every child had transcriptions by two listeners; each listener only
+heard productions from one child. A production was intelligible if a
+listener correctly transcribed the word (or a homophone).
+
+**Analysis**. We performed a Bayesian item-response analysis
+[@burknerBayesianItemResponse2019]. This mixed-effects logistic
+regression model estimates the expected intelligibility of an average
+item on an average participant (overall intercept), each participant's
+ability (by-child intercept) and each item's difficulty (by-item
+intercept). We included covariates to examine whether age and item-level
+features predicted intelligibility. These features included frequency of
+the word in speech, phonotactic probability, and motor complexity.
+Frequency counts were based on the SUBTLEX-US database
+[@subtlexus2009]; we used frequency per million words
+(log10-transformed). Phonotactic probability measures were computed
+using the IPhOD database [@vadenIrvinePhonotacticOnline], using each
+word's average biphone probability (log10-transformed). We computed each
+word's total motor complexity score using the scale by @complexity2018
+based on @kent1992. This systems assigns a score to each syllable part
+(onset, nucleus, coda) based on its articulatory motor demands, ranging
+from 1 (/ə, ɑ/) to 8 (cluster of 3 consonants). Table 1 reports the
+observed intelligibility averages and lexical characteristics for each
+item.
+
+
+
+## Results
+
+Figure 1 shows the posterior predicted intelligibility of each item for
+a new, unobserved 3-year-old child. There were reliable item-level
+differences, such that some words had a higher average intelligibility
+than others. Of the three word-level features, only frequency had a
+clear effect on average intelligibility (Figure 2). For an average item
+on an average 36-month-old child with average frequency (`r mean_freq`
+per million words), phonotactic probability (`r mean_phonprob`), and
+complexity (`r mean_comp`), the expected intelligibility was
+`r base`, 95% interval `r base_ui`. From this reference, a 10x increase
+in frequency predicted an increase in average intelligibility of
+`r diff_freq` percentage points, 95% interval `r diff_ui`. For
+phonotactic probability, both positive and negative effects were equally
+plausible, odds ratio 95% interval [`r or_phonprob_ui[1]`,
+`r or_phonprob_ui[2]`]. For a 1-point increase in motor complexity, the
+median odds ratio was `r or_comp10_med`, and the 95% interval was
+[`r or_comp10_ui[1]`, `r or_comp10_ui[2]`]. The sign of the effect is
+likely negative (complexity penalty), but it is also plausible the
+effect is too small to be meaningful. Finally, there was a clear effect
+of age: A 6-month increase (from 36 to 42 months) predicted a
+corresponding increase in intelligibility of `r diff_age` percentage
+points, 95% interval `r diff_age_ui`.
+
+
+
+## Discussion
+
+Young children's intelligibility varied greatly at the word level.
+Higher frequency words tended to be more intelligible than lower
+frequency words, and it was unclear whether the word's motor complexity
+affected intelligibility. The speakers in this study were typically
+developing, so further work is needed to see whether listeners rely more on
+word-level features when presented with disordered speech. It is
+plausible that listeners will rely more on top-down knowledge from
+lexical statistics when hearing dysarthric children.
+
+
+
+```{r table-1}
+t1 %>% 
+  knitr::kable(align = "lrrrr", caption = t1_cap)
+```
+
+## Plots (with code for sharing)
+
+### Item means plot
+
+```{r figure-1, fig.width = 5, fig.height = 6, dpi = 600, fig.cap = f1_cap, echo = TRUE}
+# This helps us position labels to nearest xth
+new_quantile_nudger <- function(
+  quantile,
+  nudge = .02,
+  round_to = .01,
+  round_with = floor
+) {
+  function(xs) {
+    plyr::round_any(
+      quantile(xs, quantile) + nudge,
+      accuracy = round_to,
+      f = round_with
+    )
+  }
+}
+
+new_data_draws_item <- data %>% 
+  distinct(prompt, age_years_3 = 0, zipf_freq3, log10_biphone3, complexity10) %>% 
+  mutate(child = "fake") 
+
+draws_item <- new_data_draws_item %>% 
+  add_epred_draws(
+    m_freq_prob_comp, 
+    ndraws = 10000, 
+    allow_new_levels = TRUE
+  ) %>% 
+  ungroup()
+
+p1 <- ggplot(draws_item) +
+  aes(x = .epred, y = fct_reorder(prompt, .epred)) +
+  ggdist::stat_interval(
+    .width = c(.95, .8, .5, 0)
+  ) +
+  ggstance::stat_summaryh(
+    aes(x = .epred, y = prompt, label = prompt), 
+    geom = "text",
+    fun.x = new_quantile_nudger(.025, -.01, .025),
+    size = 3.5,    
+    vjust = .4,
+    hjust = 1
+  ) + 
+  ggstance::stat_summaryh(
+    fun.x = median, 
+    geom = "point", 
+    size = 2, 
+    color = "black", 
+    show.legend = TRUE
+  ) +
+  scale_color_manual(
+    labels = function(xs) {
+      levels <- c(.95, .8, .5, 0)
+      labels <- c("95%", "80%", "50%", "median")
+      factor(xs, levels, labels)
+    },
+    values = c(
+      "0.95" = "#FADDC3", 
+      "0.8" = "#F6A173", 
+      "0.5" = "#EA4C3B", 
+      "0" = "black"
+      # "median" = "black"
+    )
+  ) +
+  scale_x_continuous(
+    "Estimated intelligibility for a new 3-year-old participant", 
+    labels = scales::percent_format(5), 
+    sec.axis = dup_axis(name = NULL)
+  ) +
+  coord_cartesian(clip = "off") +
+  guides(
+    color = guide_legend(
+      title = "Posterior intervals",
+      # Customize appearance of four boxes in legend
+      override.aes = list(
+        # Draw lines in first three, no line in last.
+        linetype = c(rep(1, 3), 0),
+        #  Draw the point in last one.
+        shape = c(rep(NA, 3), 16)
+      )
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(hjust = 1),
+    axis.text.y = element_blank(), 
+    axis.title.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position = "bottom",
+    legend.justification = "right",
+    legend.title = element_text(size = rel(.8)),
+    legend.text = element_text(size = rel(.8)),
+    legend.key = element_rect(fill = NA, color = NA),
+    legend.box.spacing = unit(0, "pt"),
+    legend.background = element_rect(fill = NA, color = NA)
+  ) + 
+  labs(
+    title = "Some words are more difficult than others"
+  )
+
+p1
+```
+
+### Frequency plot
+
+```{r figure-2, fig.width = 5, fig.height = 4, dpi = 600, fig.cap = f2_cap, echo = TRUE}
+data2 <- data %>% 
+  mutate(
+    age_bin = NA,
+    age_bin = ifelse(age %in% c(30:35), "30-35", age_bin),
+    age_bin = ifelse(age %in% c(36:41), "36-41", age_bin),
+    age_bin = ifelse(age %in% c(42:47), "42-47", age_bin),
+    age2 = NA,
+    age2 = ifelse(age %in% c(30:35), 32.5, age2),
+    age2 = ifelse(age %in% c(36:41), 38.5, age2),
+    age2 = ifelse(age %in% c(42:47), 44.5, age2)
+  ) %>% 
+  group_by(age_bin) %>% 
+  mutate(
+    age_years_3 = (age2 - 36) / 12
+  )
+
+fitted_freq_prompt <- data %>% 
+  tidyr::expand(
+    age_years_3 = 0,
+    log10_biphone3 = mean(log10_biphone3),
+    complexity10 = mean(complexity10),
+    zipf_freq3 = seq(-.1, 3.8, length.out = 100)
+  ) %>% 
+  mutate(freq_per_million = 10 ^ zipf_freq3) %>% 
+  add_epred_draws(
+    m_freq_prob_comp, 
+    ndraws = 10000,
+    re_formula = NA,
+    allow_new_levels = TRUE
+  ) 
+
+freq_prompt_intervals <- fitted_freq_prompt %>% 
+  median_qi(.epred, .width = c(.95, .8, .5)) %>% 
+  mutate(
+    .width = scales::percent(.width, accuracy = 1)
+  ) 
+
+widths <- c("95%", "80%", "50%", "median")
+col_purple_median <- colorspace::sequential_hcl(palette = "Sunset", n = 1)
+col_fills <- colorspace::sequential_hcl(
+  3, 
+  palette = "OrYel", 
+  alpha = .6, 
+  rev = TRUE
+)
+
+library(ggrepel)
+
+p2b <- ggplot(freq_prompt_intervals) +
+  aes(x = freq_per_million, y = .epred) + 
+  geom_lineribbon(
+    aes(
+      fill = .width, 
+      color = .point, 
+      ymin = .lower, 
+      ymax = .upper, 
+      group = age_years_3
+    ) 
+  ) +
+    stat_summary(
+    aes(
+      x = word_freq_per_million, 
+      group = prompt, 
+      y = m_word_a 
+    ),
+    data = data,
+    geom = "point",
+  ) +
+  stat_summary(
+    aes(
+      x = word_freq_per_million, 
+      group = prompt, 
+      y = m_word_a, 
+      label = prompt
+    ),
+    data = data,
+    geom = "text_repel",
+    min.segment.length = 0
+  ) +
+  scale_x_log10() +
+  scale_y_continuous(
+    labels = scales::percent_format(5), 
+    breaks = c(0, .25, .5, .75, 1)
+  ) +
+  expand_limits(y = c(0, 1)) +
+  scale_fill_manual(
+    aesthetics = c("fill", "colour"),
+    breaks = c("95%", "80%", "50%", "median"),
+    values = c(col_fills, col_purple_median)
+  ) +
+  guides(
+    fill = guide_legend(
+      title = "Posterior intervals",
+      override.aes = list(
+        fill = c("#ECE0BA", "#F0B778", "#EF746E", NA),
+        color = c(NA, NA, NA, col_purple_median),
+        linetype = c(rep(0, 3), 1)
+      )
+    ),
+    color = "none"
+  ) + 
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor.x = element_blank(),
+    legend.position = "bottom",
+    legend.justification = "right",
+    legend.title = element_text(size = rel(.8)),
+    legend.text = element_text(size = rel(.8)),
+    legend.key = element_rect(fill = NA, color = NA),
+    legend.box.spacing = unit(0, "pt"),
+    legend.background = element_rect(fill = NA, color = NA)
+  ) + 
+  labs(
+    x = "Frequency per million words", 
+    y = "Average intelligibility"
+  )
+p2b
+```
+
+(Note to self: The points are the whole dataset (all ages) but the
+frequency effect plotted is for a 36-month-old. Kind of a mismatch there)
+
+
+
+## Extras (from the poster)
+
+```{r, echo = TRUE}
+m_baseline <- targets::tar_read("model_baseline_age_slope")
+summary(m_baseline, priors = TRUE)
+```
+
+### Plot of observed age x item
+
+```{r, echo = TRUE, fig.width = 5, fig.height = 7, dpi = 600}
+data <- data %>% 
+  group_by(age %/% 6) %>% 
+  mutate(
+    age_bin = (age %/% 6) * 6,
+    age_bin = printy::skel_range(
+      wisclabmisc::format_year_month_age(age_bin),
+      wisclabmisc::format_year_month_age(age_bin + 5),
+    ),
+    age_bin = glue::glue("{age_bin} ({n_distinct(child)})")
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    prompt2 = forcats::fct_reorder(prompt, m_word_a, .fun = mean)
+  ) 
+
+# For a horizontal legend key
+draw_key_pointrangeh <- function(data, params, size) {
+  `%||%` <- rlang::`%||%`
+  grid::grobTree(
+    ggplot2::draw_key_path(data, params, size), 
+    ggplot2::draw_key_point(
+      transform(data, size = (data$size %||% 1.5) * 4), 
+      params
+    )
+  )
+}
+
+p0 <- ggplot(data) + 
+  aes(x = m_word_a, y = prompt2, shape = age_bin) + 
+  stat_summary(aes(color = age_bin), key_glyph = draw_key_pointrangeh) +
+  ggokabeito::scale_color_okabe_ito() +
+  scale_x_continuous(
+    "Item intelligibility [Mean ± SE]",
+    labels = scales::percent_format(),
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.text = ggtext::element_markdown(), 
+    legend.position = "bottom", 
+  ) +
+  labs(color = "Ages", shape = "Ages", y = NULL) 
+
+p0
+```
+
+### Variance comparison plot
+
+```{r variance comparison}
+#| out.width: 66%
+#| fig.width: 5.5
+#| fig.height: 4
+#| echo: TRUE
+#| dpi: 600
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(ggdist)
+library(dplyr)
+library(ggtext)
+
+data_model <- targets::tar_read("data_model")
+
+data_model <- data_model %>% 
+  filter(prompt == sentence) %>% 
+  group_by(age %/% 6) %>% 
+  mutate(
+    age_bin = (age %/% 6) * 6,
+    age_bin = printy::skel_range(
+      wisclabmisc::format_year_month_age(age_bin),
+      wisclabmisc::format_year_month_age(age_bin + 5),
+    ),
+    age_bin = glue::glue("{age_bin} ({n_distinct(child)})")
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    prompt2 = forcats::fct_reorder(prompt, m_word_a, .fun = mean)
+  ) 
+
+model_baseline <- targets::tar_read(model_baseline_age_slope)
+
+
+new_data <- data_model %>% 
+  tidyr::expand(
+    child = "fake child",
+    prompt = "fake prompt",
+    age_years_3 = 0
+  )
+
+epred_child <- new_data %>% 
+  add_epred_draws(
+    model_baseline,
+    allow_new_levels = TRUE,
+    re_formula = ~ (1 | child)
+  )
+epred_item <- new_data %>% 
+  add_epred_draws(
+    model_baseline,
+    allow_new_levels = TRUE,
+    re_formula = ~ (1 | prompt)
+  )
+
+p1 <- ggplot() +
+  stat_interval(
+    aes(x = .epred, y = "Model:\naverage item\nnew child"),
+    data = epred_child
+  ) +
+  stat_interval(
+    aes(x = .epred, y = "Model:\naverage child\nnew item"),
+    data = epred_item
+  ) + 
+  geom_boxplot(
+    aes(x = intel, y = "Observed: item\nintelligibilities", group = age_bin),
+    data = data_model %>% 
+      group_by(item, age_bin) %>% 
+      summarise(intel = mean(m_word_a)),
+    position = position_dodge2(width = .5)
+  ) +
+  geom_boxplot(
+    aes(x = intel, y = "Observed: child\nintelligibilities", group = age_bin),
+    data = data_model %>% 
+      group_by(child, age_bin) %>% 
+      summarise(intel = mean(m_word_a)),
+    position = position_dodge2()
+  ) +
+  stat_boxplot(
+    aes(x = 1, y = "Observed: child\nintelligibilities", group = age_bin, label = age_bin),
+    data = data_model %>% 
+      group_by(age_bin, child) %>% 
+      summarise(intel = mean(m_word_a)),
+    hjust = 0,
+    geom = "richtext",
+    label.colour = NA,
+    fill = scales::alpha("white", .8),
+    size = 4, 
+    position = position_dodge2(width = .85)
+  ) +
+  stat_boxplot(
+    aes(x = 1, y = "Observed: item\nintelligibilities", group = age_bin, label = age_bin),
+    data = data_model %>% 
+      group_by(age_bin, item) %>% 
+      summarise(intel = mean(m_word_a)),
+    hjust = 0,
+    geom = "richtext",
+    label.colour = NA,
+    fill = scales::alpha("white", .8),
+    size = 4, 
+    position = position_dodge2(width = .85)
+  ) +
+  colorspace::scale_color_discrete_sequential("Peach") +
+  scale_x_continuous(
+    limits = c(0, 1.3), 
+    labels = scales::label_percent(),
+    breaks = 0:5 / 5
+  ) +
+  labs(
+    x = "Expected intelligibility", 
+    y = NULL, 
+    color = "Posterior\nintervals"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 14) + 
+  theme(
+    legend.position = c(.999, .45), 
+    legend.text.align = 1,
+    legend.title.align = 1,
+    legend.background = element_rect(fill = scales::alpha("white", .8), color = NA),
+    legend.justification = c(1, 1),
+    panel.grid.major.y = element_blank()
+  ) 
+p1
+```
+
+
+### Item slopes plot
+
+```{r item-slopes}
+#| out.width: 66%
+#| fig.width: 4
+#| fig.height: 4
+#| echo: TRUE
+#| dpi: 600
+item_slopes <- targets::tar_read("epred_item_slopes")
+
+# justs for "justifications" (horizontal location)
+justs <- item_slopes %>% 
+  filter(age == 30, .width == .5) %>% 
+  arrange(.epred) %>% 
+  mutate(
+    hjust = rep(ppoints(6), 10)[1:38]
+  ) %>% 
+  select(prompt, hjust)
+
+p2 <- ggplot(item_slopes %>% left_join(justs)) +
+  aes(x = age) + 
+  geomtextpath::geom_labelline(
+    aes(
+      label = prompt, 
+      y = .epred, 
+      group = prompt,
+      color = factor(hjust),
+      hjust = hjust,
+      boxcolour = NA,
+    ),
+    alpha = NA,
+    label.padding = unit(.05, "lines"),
+    boxlinewidth = 0, 
+    size = 3,
+    vjust = .5,
+    label.r = unit(0, "lines"),
+    fill = scales::alpha("#FFFFFF", .9)
+  ) + 
+  geomtextpath::scale_hjust_identity(guide = "none") + 
+  theme_minimal(base_size = 14) +
+  guides(color = "none") +
+  scale_x_continuous(
+    "Age", 
+    breaks = c(30, 36, 42, 48),
+    labels = wisclabmisc::format_year_month_age
+  ) +
+  scale_y_continuous(
+    "Expected intelligibility", 
+    labels = scales::percent_format()
+  ) +
+  guides(color = "none") +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(
+    values = c("grey30", palette.colors(n = 2, "Dark 2")) |> rep(2)
+  )
+p2
+```
+
+
+
+## References
